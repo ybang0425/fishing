@@ -1,0 +1,882 @@
+/**
+* 낚시 게임 봇 v11.0.0 (Final Version)
+*
+* @description
+* 최종 리팩토링: 성능 최적화, 핵심 기능 구현, 데이터 일관성 확보
+* - 증분 랭킹 업데이트 도입으로 I/O 최소화
+* - TTL(Time-To-Live) 기반의 LRU 캐시 적용
+* - 스키마 버전 통일 및 마이그레이션 로직 명확화
+* - 구매, 레벨업, 상점, 랭킹 등 핵심 기능 핸들러 전체 구현
+*/
+
+const bot = BotManager.getCurrentBot();
+
+// ==================== 전역 상태 관리 ====================
+let SysConfig = {};
+let GameConfig = {};
+let GameData = {};
+let Locales = {};
+let CommandMap = {};
+
+let PlayerCache;
+let RankingCache = { asset: [], level: [], collection: [] };
+let ActiveSessions = new Set();
+let ActiveTimers = {};
+let lastGlobalFishAt = 0;
+
+// ==================== 모듈: DataManager ====================
+const DataManager = {
+   getHash: function(nick) {
+       let hash = 0;
+       for (let i = 0; i < nick.length; i++) {
+           hash = ((hash << 5) - hash) + nick.charCodeAt(i);
+           hash = hash & hash;
+       }
+       return Math.abs(hash) % SysConfig.hashBuckets;
+   },
+
+   getPlayerFilePath: function(nick) {
+       return SysConfig.dataRoot + "players/hash_" + DataManager.getHash(nick) + "/" + nick + ".json";
+   },
+
+   getRankingFilePath: function() {
+       return SysConfig.dataRoot + "index/rankings_cache.json";
+   },
+
+   initializeDirectories: function() {
+       for (let h = 0; h < SysConfig.hashBuckets; h++) {
+           FileStream.write(SysConfig.dataRoot + "players/hash_" + h + "/.init", "");
+       }
+       FileStream.write(SysConfig.dataRoot + "index/.init", "");
+       Log.i("데이터 디렉토리 구조 초기화 완료");
+   },
+
+   atomicWrite: function(path, data) {
+       let tempPath = path + ".tmp";
+       let backupPath = path + ".bak";
+       try {
+           FileStream.write(tempPath, JSON.stringify(data, null, 2));
+           if (FileStream.read(path)) FileStream.write(backupPath, FileStream.read(path));
+           FileStream.write(path, FileStream.read(tempPath));
+           FileStream.remove(tempPath);
+           if (FileStream.read(backupPath)) FileStream.remove(backupPath);
+           return true;
+       } catch (e) {
+           Log.e("[atomicWrite] 파일 쓰기 실패: " + path + " - " + e.message);
+           if (FileStream.read(backupPath)) {
+               try {
+                   FileStream.write(path, FileStream.read(backupPath));
+                   Log.i("[atomicWrite] 롤백 성공: " + path);
+               } catch (rollBackError) {
+                   Log.e("[atomicWrite] 롤백 실패: " + path + " - " + rollBackError.message);
+               }
+           }
+           if (FileStream.read(tempPath)) FileStream.remove(tempPath);
+           return false;
+       }
+   },
+
+   loadGameData: function() {
+       try {
+           let basePath = "sdcard/msgbot/fishing_game/config/";
+           let files = ["config", "game_configs", "fish_data", "rods", "baits", "titles", "cook_suffixes", "level_costs", "locales", "commands"];
+           let jsonData = files.map(function(file) {
+               return JSON.parse(FileStream.read(basePath + file + ".json"));
+           });
+           
+           SysConfig = jsonData[0];
+           GameConfig = jsonData[1];
+           GameData.FISH = jsonData[2];
+           GameData.RODS = jsonData[3];
+           GameData.BAITS = jsonData[4];
+           GameData.TITLES = jsonData[5];
+           GameData.COOK_SUFFIXES = jsonData[6].suffixes;
+           GameData.LEVEL_COSTS = jsonData[7].costs;
+           Locales = jsonData[8];
+           CommandMap = jsonData[9];
+           
+           DataManager.buildReverseLookups();
+           Log.i("모든 게임 데이터 로드 완료");
+           return true;
+       } catch (e) {
+           Log.e("게임 데이터 로드 실패: " + e.message + "\n" + e.stack);
+           return false;
+       }
+   },
+
+   buildReverseLookups: function() {
+       GameData.ITEM_MASTER = {};
+       Object.keys(GameData.RODS).forEach(function(key) {
+           let rod = GameData.RODS[key];
+           if (rod.price > 0) GameData.ITEM_MASTER[rod.name] = { type: "rod", key: key, data: rod };
+       });
+       GameData.BAITS.paid.forEach(function(bait) {
+           GameData.ITEM_MASTER[bait.name] = { type: "bait", key: bait.key, data: bait };
+       });
+       GameData.COOK_REVERSE = new Set(GameData.COOK_SUFFIXES);
+       Log.i("역참조 맵 생성 완료");
+   },
+
+   updatePlayerIndex: function(nick, action) {
+       let indexPath = SysConfig.dataRoot + "index/player_list.json";
+       let indexData = FileStream.read(indexPath);
+       let index = indexData ? JSON.parse(indexData) : { players: {}, count: 0 };
+   
+       if (action === "add" && !index.players[nick]) {
+           index.players[nick] = { createdAt: Date.now() };
+           index.count++;
+       } else if (action === "remove" && index.players[nick]) {
+           delete index.players[nick];
+           index.count--;
+       }
+   
+       DataManager.atomicWrite(indexPath, index);
+   }
+};
+
+// ==================== 모듈: PlayerService ====================
+const PlayerService = {
+   getPlayer: function(nick) {
+       let cachedPlayer = PlayerCache.get(nick);
+       if (cachedPlayer) return cachedPlayer;
+
+       let path = DataManager.getPlayerFilePath(nick);
+       let fileData = FileStream.read(path);
+       if (!fileData) return null;
+
+       let player = JSON.parse(fileData);
+       if (player.schemaVersion < SysConfig.schemaVersion) {
+           PlayerService.migratePlayer(player);
+       }
+       
+       PlayerCache.set(nick, player);
+       return player;
+   },
+
+   createPlayer: function(nick) {
+       let defaults = GameConfig.playerDefaults;
+       let player = {
+           nick: nick,
+           isMember: true,
+           schemaVersion: SysConfig.schemaVersion,
+           createdAt: Date.now(),
+           lastModified: Date.now(),
+           profile: { level: defaults.level, money: GameConfig.balance.tutorialReward, activeTitle: defaults.activeTitle },
+           inventory: {},
+           collection: {},
+           equipment: {
+               rod: defaults.rod,
+               ownedRods: {},
+               ownedBaits: {},
+               activeBait: null,
+               ownedTitles: {},
+               customBaits: GameData.BAITS.custom.defaults.slice() 
+           },
+           stats: { totalCaught: 0, totalEarned: 0, lastFishAt: 0, lastPillageAt: 0, playTime: 0, firstFishAt: 0 },
+           buffs: {}
+       };
+       
+       player.equipment.ownedRods[defaults.rod] = true;
+       player.equipment.ownedTitles["칭호없음"] = true;
+
+       PlayerService.savePlayer(player, { isNew: true });
+       DataManager.updatePlayerIndex(nick, "add");
+       return player;
+   },
+
+   savePlayer: function(player, options) {
+       if (!options) options = {};
+       player.lastModified = Date.now();
+       let path = DataManager.getPlayerFilePath(player.nick);
+       DataManager.atomicWrite(path, player);
+       PlayerCache.set(player.nick, player);
+       
+       if (!options.isNew) {
+           RankingManager.updateRankingIncremental(player);
+       }
+   },
+   
+   migratePlayer: function(player) {
+       if (player.schemaVersion < 2) {
+           if (!player.equipment.customBaits) {
+               player.equipment.customBaits = GameData.BAITS.custom.defaults.slice();
+           }
+       }
+       player.schemaVersion = SysConfig.schemaVersion;
+       Log.i(player.nick + "님의 데이터를 스키마 v" + player.schemaVersion + "으로 마이그레이션했습니다.");
+   }
+};
+
+// ==================== 모듈: RankingManager ====================
+const RankingManager = {
+   loadRankingCache: function() {
+       let path = DataManager.getRankingFilePath();
+       let data = FileStream.read(path);
+       RankingCache = data ? JSON.parse(data) : { asset: [], level: [], collection: [] };
+   },
+
+   updateRankingIncremental: function(player) {
+       ["asset", "level", "collection"].forEach(function(type) {
+           let list = RankingCache[type];
+           let idx = list.findIndex(function(r) { return r.nick === player.nick; });
+           let value = type === "asset" ? player.profile.money :
+                      type === "level" ? player.profile.level :
+                      Object.keys(player.collection).length;
+
+           if (idx > -1) {
+               list[idx].value = value;
+           } else {
+               list.push({ nick: player.nick, value: value });
+           }
+           
+           list.sort(function(a, b) { return b.value - a.value; });
+           
+           if (list.length > 100) {
+               RankingCache[type] = list.slice(0, 100);
+           }
+       });
+       DataManager.atomicWrite(DataManager.getRankingFilePath(), RankingCache);
+   },
+
+   updateRankingFullScan: function() {
+       Log.i("랭킹 전체 스캔 시작...");
+       let indexPath = SysConfig.dataRoot + "index/player_list.json";
+       let indexData = FileStream.read(indexPath);
+       if (!indexData) return;
+
+       let playerNicks = Object.keys(JSON.parse(indexData).players);
+       let newRankings = { asset: [], level: [], collection: [] };
+
+       playerNicks.forEach(function(nick) {
+           let p = PlayerService.getPlayer(nick);
+           if (p) {
+               newRankings.asset.push({ nick: p.nick, value: p.profile.money });
+               newRankings.level.push({ nick: p.nick, value: p.profile.level });
+               newRankings.collection.push({ nick: p.nick, value: Object.keys(p.collection).length });
+           }
+       });
+
+       Object.keys(newRankings).forEach(function(type) {
+           newRankings[type].sort(function(a, b) { return b.value - a.value; });
+           newRankings[type] = newRankings[type].slice(0, 100);
+       });
+       
+       RankingCache = newRankings;
+       DataManager.atomicWrite(DataManager.getRankingFilePath(), RankingCache);
+       Log.i("랭킹 전체 스캔 완료.");
+   }
+};
+
+// ==================== 모듈: Utils ====================
+const Utils = {
+   moneyStr: function(n) {
+       return n.toLocaleString("ko-KR") + "원";
+   },
+   
+   randomChoice: function(arr) {
+       return arr[Math.floor(Math.random() * arr.length)];
+   },
+   
+   formatTime: function(ms) {
+       let s = Math.floor(ms / 1000);
+       if (s > 3600) return Math.floor(s/3600) + "시간 " + Math.floor((s%3600)/60) + "분";
+       if (s > 60) return Math.floor(s/60) + "분 " + (s%60) + "초";
+       return s + "초";
+   },
+   
+   format: function(path, vars) {
+       if (!vars) vars = {};
+       let parts = path.split(".");
+       let template = Locales;
+       for (let i = 0; i < parts.length; i++) {
+           template = template[parts[i]];
+           if (!template) break;
+       }
+       if (!template) return "[메시지 없음: " + path + "]";
+       
+       let processor = function(line) {
+           return line.replace(/{(\w+)}/g, function(match, key) {
+               return vars[key] !== undefined ? vars[key] : match;
+           });
+       };
+       
+       return Array.isArray(template) ? template.map(processor).join("\n") : processor(template);
+   },
+   
+   getLevelProgress: function(player) {
+       if (player.profile.level >= 10) return { percent: 100, remaining: 0 };
+       let currentLevelCost = GameData.LEVEL_COSTS[player.profile.level - 1] || 0;
+       let nextLevelCost = GameData.LEVEL_COSTS[player.profile.level] || 0;
+       let needed = nextLevelCost - currentLevelCost;
+       if (needed <= 0) return { percent: 100, remaining: 0 };
+       let progress = player.profile.money - currentLevelCost;
+       return { 
+           percent: Math.min(100, Math.floor((Math.max(0, progress) / needed) * 100)), 
+           remaining: Math.max(0, nextLevelCost - player.profile.money) 
+       };
+   },
+   
+   createProgressBar: function(percent) {
+       let filled = Math.floor(percent/10);
+       let empty = 10 - filled;
+       let bar = "";
+       for (let i = 0; i < filled; i++) bar += "■";
+       for (let i = 0; i < empty; i++) bar += "□";
+       return "[" + bar + "]";
+   },
+   
+   asyncDelay: function(name, ms, fn) {
+       if (ActiveTimers[name]) {
+           try { ActiveTimers[name].cancel(); } catch(e) {}
+       }
+       let task = new JavaAdapter(java.util.TimerTask, {
+           run: function() {
+               try { fn(); }
+               catch(e) { Log.e(name + " 타이머 오류: " + e.message + "\n" + e.stack); }
+               finally { delete ActiveTimers[name]; }
+           }
+       });
+       let timer = new java.util.Timer();
+       timer.schedule(task, ms);
+       ActiveTimers[name] = timer;
+   }
+};
+
+// ==================== 모듈: GameLogic ====================
+const GameLogic = {
+   resolveFishing: function(player) {
+       let now = Date.now();
+       let rod = GameData.RODS[player.equipment.rod];
+       let title = GameData.TITLES[player.profile.activeTitle];
+       
+       let baitEffects = {};
+       if (player.equipment.activeBait && player.equipment.activeBait.expires > now) {
+           let baitData = GameData.BAITS.paid.find(function(b) { 
+               return b.key === player.equipment.activeBait.key; 
+           });
+           if(baitData) baitEffects = baitData.effects;
+       } else {
+           baitEffects = GameData.BAITS.free.effects;
+       }
+
+       let buffRareBonus = 0;
+       if (player.buffs.rareBoost && player.buffs.rareBoost.expires > now) {
+           buffRareBonus = player.buffs.rareBoost.value;
+       } else {
+           delete player.buffs.rareBoost;
+       }
+
+       let eligibleFish = [];
+       let totalWeight = 0;
+       
+       let fishPool = GameData.FISH.fishByLevel[player.profile.level] || [];
+       fishPool.forEach(function(fishName) {
+           let fish = GameData.FISH.fishData[fishName];
+           let finalChance = fish.chance;
+
+           if (baitEffects.catchBoost) finalChance *= (1 + baitEffects.catchBoost);
+           if (baitEffects[fish.grade]) finalChance *= baitEffects[fish.grade];
+           
+           let rareBonus = (rod.rareBonus || 0) + ((title && title.effect.rareBonus) || 0) + buffRareBonus;
+           if (fish.grade === "trash") {
+               finalChance *= (1 + (rod.trashBonus || 0));
+           } else if (fish.isRare) {
+               finalChance *= (1 + rareBonus);
+           }
+           
+           if (finalChance > 0) {
+               eligibleFish.push({name: fishName, weight: finalChance, data: fish});
+               totalWeight += finalChance;
+           }
+       });
+
+       if (eligibleFish.length === 0) return { success: false };
+
+       let roll = Math.random() * totalWeight;
+       let caughtFish;
+       for (let i = 0; i < eligibleFish.length; i++) {
+           let fish = eligibleFish[i];
+           if (roll < fish.weight) {
+               caughtFish = fish;
+               break;
+           }
+           roll -= fish.weight;
+       }
+       if (!caughtFish) caughtFish = eligibleFish[eligibleFish.length - 1];
+
+       return {
+           success: true,
+           fish: caughtFish.data,
+           baitUsed: player.equipment.activeBait ? player.equipment.activeBait.name : null
+       };
+   },
+
+   calculatePrice: function(itemName, player) {
+       let basePrice = 0;
+       let isCooked = itemName.startsWith("[요리]");
+       let baseName = itemName;
+
+       if (isCooked) {
+           let cookedNameOnly = itemName.substring(4);
+           let suffixes = Array.from(GameData.COOK_REVERSE);
+           for (let i = 0; i < suffixes.length; i++) {
+               let suffix = suffixes[i];
+               if (cookedNameOnly.endsWith(suffix)) {
+                   let potentialBaseName = cookedNameOnly.slice(0, -suffix.length);
+                   if (GameData.FISH.fishData[potentialBaseName]) {
+                       baseName = potentialBaseName;
+                       break;
+                   }
+               }
+           }
+       }
+       
+       let fish = GameData.FISH.fishData[baseName];
+       if (fish) basePrice = fish.price;
+       if (isCooked) basePrice *= GameConfig.balance.cookRate;
+
+       let rod = GameData.RODS[player.equipment.rod];
+       let title = GameData.TITLES[player.profile.activeTitle];
+       let titleSellBonus = (title && title.effect.sellBonus) || 0;
+
+       return Math.round(basePrice * (1 + (rod.sellBonus || 0) + titleSellBonus));
+   }
+};
+
+// ==================== 모듈: CommandHandler ====================
+const CommandHandler = {
+   handleHelp: function(cmd, player) {
+       let viewMore = "\u200b".repeat(500);
+       cmd.reply(Utils.format("ui.help.main", { prefix: SysConfig.commandPrefix, viewMore: viewMore }));
+   },
+
+   handleRegister: function(cmd, player) {
+       if (player) {
+           cmd.reply(Utils.format("errors.alreadyRegistered"));
+           return;
+       }
+       let newPlayer = PlayerService.createPlayer(cmd.author.name);
+       cmd.reply(Utils.format("general.registerSuccess", {
+           nick: newPlayer.nick,
+           reward: Utils.moneyStr(GameConfig.balance.tutorialReward)
+       }));
+   },
+
+   handleInfo: function(cmd, player) {
+       let tpl = Locales.ui.playerInfo;
+       let rod = GameData.RODS[player.equipment.rod];
+       let progress = Utils.getLevelProgress(player);
+
+       let baitInfo = "기본미끼";
+       if (player.equipment.activeBait) {
+           let remaining = player.equipment.activeBait.expires - Date.now();
+           if (remaining > 0) {
+               baitInfo = player.equipment.activeBait.name + " (" + Utils.formatTime(remaining) + " 남음)";
+           }
+       }
+
+       let replacements = {
+           title: player.profile.activeTitle === "칭호없음" ? "" : "[" + player.profile.activeTitle + "]",
+           nick: player.nick,
+           level: player.profile.level,
+           expPercent: progress.percent,
+           progressBar: Utils.createProgressBar(progress.percent),
+           levelStatus: player.profile.level < 10 ? "다음 레벨까지: " + Utils.moneyStr(progress.remaining) : "최고 레벨 달성!",
+           money: Utils.moneyStr(player.profile.money),
+           totalCaught: player.stats.totalCaught.toLocaleString(),
+           playTime: Utils.formatTime(player.stats.playTime),
+           collectionCount: Object.keys(player.collection).length,
+           totalFish: GameData.FISH.totalFishCount,
+           rodName: rod.name,
+           baitInfo: baitInfo,
+           activeTitle: player.profile.activeTitle
+       };
+       
+       let body = tpl.body.map(function(line) { 
+           return Utils.format(line, replacements); 
+       }).join("\n");
+       
+       cmd.reply(tpl.header + "\n" + Utils.format(tpl.title, replacements) + "\n" + body + "\n" + tpl.footer);
+   },
+
+   handleFishing: function(cmd, player) {
+       let now = Date.now();
+       player.stats.lastFishAt = now;
+       lastGlobalFishAt = now;
+       if (!player.stats.firstFishAt) player.stats.firstFishAt = now;
+
+       let result = GameLogic.resolveFishing(player);
+
+       if (!result.success) {
+           cmd.reply(Utils.format("fishing.fail"));
+           return;
+       }
+
+       let fish = result.fish;
+       let baitUsed = result.baitUsed;
+       player.inventory[fish.name] = (player.inventory[fish.name] || 0) + 1;
+       player.collection[fish.name] = true;
+       player.stats.totalCaught++;
+       player.stats.playTime = now - player.stats.firstFishAt;
+       
+       PlayerService.savePlayer(player);
+       
+       let baitDisplay = baitUsed ? " [" + baitUsed + " 사용]" : "";
+       let endings = GameData.FISH.endingsByGrade[fish.grade] || GameData.FISH.endingsByGrade.normal;
+       let ending = Utils.randomChoice(endings);
+       
+       cmd.reply(Utils.format("fishing.success", {
+           emoji: fish.emoji,
+           title: player.profile.activeTitle === "칭호없음" ? "" : "[" + player.profile.activeTitle + "]",
+           nick: player.nick,
+           fish: fish.name,
+           ending: ending,
+           baitDisplay: baitDisplay
+       }));
+   },
+   
+   handleSell: function(cmd, player) {
+       let itemName = cmd.args[0];
+       let qty = parseInt(cmd.args[1]) || 0;
+   
+       if (!itemName) {
+           cmd.reply(Utils.format("errors.invalidArgs", {command: "판매", usage: "<아이템|전체> [수량]"}));
+           return;
+       }
+
+       if (itemName === "전체") {
+           let totalEarned = 0;
+           let soldCount = 0;
+           Object.keys(player.inventory).forEach(function(item) {
+               let count = player.inventory[item];
+               if (count > 0) {
+                   let price = GameLogic.calculatePrice(item, player);
+                   totalEarned += price * count;
+                   soldCount += count;
+               }
+           });
+           
+           if (soldCount === 0) {
+               cmd.reply(Utils.format("general.noItemToSell"));
+               return;
+           }
+           player.inventory = {};
+           player.profile.money += totalEarned;
+           player.stats.totalEarned += totalEarned;
+           PlayerService.savePlayer(player);
+           cmd.reply(Utils.format("general.sellAllSuccess", {count: soldCount, earned: Utils.moneyStr(totalEarned)}));
+           return;
+       }
+       
+       if (!player.inventory[itemName] || player.inventory[itemName] <= 0) {
+           cmd.reply(Utils.format("errors.itemNotFound"));
+           return;
+       }
+       qty = qty <= 0 || qty > player.inventory[itemName] ? player.inventory[itemName] : qty;
+       
+       let price = GameLogic.calculatePrice(itemName, player);
+       let earned = price * qty;
+       player.inventory[itemName] -= qty;
+       if (player.inventory[itemName] <= 0) delete player.inventory[itemName];
+       
+       player.profile.money += earned;
+       player.stats.totalEarned += earned;
+       PlayerService.savePlayer(player);
+       
+       cmd.reply(Utils.format("general.sellSuccess", {itemName: itemName, qty: qty, earned: Utils.moneyStr(earned)}));
+   },
+   
+   handleLevelUp: function(cmd, player) {
+       if (player.profile.level >= 10) {
+           cmd.reply(Utils.format("errors.maxLevel"));
+           return;
+       }
+       let required = GameData.LEVEL_COSTS[player.profile.level];
+       if (player.profile.money < required) {
+           cmd.reply(Utils.format("errors.insufficientFunds", {
+               required: Utils.moneyStr(required),
+               lacking: Utils.moneyStr(required - player.profile.money)
+           }));
+           return;
+       }
+       player.profile.level++;
+       PlayerService.savePlayer(player);
+       cmd.reply(Utils.format("general.levelUp", { nick: player.nick, level: player.profile.level }));
+   },
+
+   handleShop: function(cmd, player) {
+       let tpl = Locales.ui.shop;
+       let rodList = [];
+       Object.keys(GameData.RODS).forEach(function(key) {
+           if (key === "basic") return;
+           let rod = GameData.RODS[key];
+           let ownedMarker = player.equipment.ownedRods[key] ? " (보유중)" : "";
+           let canBuyMarker = player.profile.money >= rod.price ? "✅" : "❌";
+           let details;
+           if (player.profile.level < rod.minLv) {
+               details = Utils.format(tpl.rod_locked, { minLv: rod.minLv });
+           } else {
+               details = Utils.format(tpl.rod_details, { price: Utils.moneyStr(rod.price) });
+           }
+           rodList.push(Utils.format(tpl.rod_item, { canBuyMarker: canBuyMarker, name: rod.name, ownedMarker: ownedMarker }) + "\n" + details);
+       });
+
+       let baitList = [];
+       GameData.BAITS.paid.forEach(function(bait) {
+           let ownedCount = player.equipment.ownedBaits[bait.key] || 0;
+           let ownedMarker = ownedCount > 0 ? " (" + ownedCount + "개 보유)" : "";
+           baitList.push(Utils.format(tpl.bait_item, { name: bait.name, ownedMarker: ownedMarker }) + "\n" + Utils.format(tpl.bait_details, { price: Utils.moneyStr(bait.price) }));
+       });
+
+       let msg = tpl.header + "\n" + tpl.rod_header + "\n" + rodList.join("\n") + "\n" + tpl.bait_header + "\n" + baitList.join("\n") + "\n" + tpl.footer;
+       cmd.reply(msg);
+   },
+
+   handleBuy: function(cmd, player) {
+       let itemName = cmd.args.join(" ");
+       if (!itemName) {
+           cmd.reply(Utils.format("errors.invalidArgs", { command: "구매", usage: "<아이템 이름>" }));
+           return;
+       }
+
+       let itemInfo = GameData.ITEM_MASTER[itemName];
+       if (!itemInfo) {
+           cmd.reply(Utils.format("errors.itemNotFound"));
+           return;
+       }
+
+       let type = itemInfo.type;
+       let key = itemInfo.key;
+       let data = itemInfo.data;
+       
+       if (player.profile.money < data.price) {
+           cmd.reply(Utils.format("errors.insufficientFunds", {
+               required: Utils.moneyStr(data.price),
+               lacking: Utils.moneyStr(data.price - player.profile.money)
+           }));
+           return;
+       }
+
+       if (type === "rod") {
+           if (player.equipment.ownedRods[key]) {
+               cmd.reply(Utils.format("errors.alreadyOwned"));
+               return;
+           }
+           if (player.profile.level < data.minLv) {
+               cmd.reply(Utils.format("errors.insufficientLevel", { required: data.minLv }));
+               return;
+           }
+           player.profile.money -= data.price;
+           player.equipment.ownedRods[key] = true;
+       } else if (type === "bait") {
+           player.profile.money -= data.price;
+           player.equipment.ownedBaits[key] = (player.equipment.ownedBaits[key] || 0) + 1;
+       }
+
+       PlayerService.savePlayer(player);
+       cmd.reply(Utils.format("general.buySuccess", { itemName: data.name }));
+   },
+
+   handleRanking: function(cmd, player) {
+       let type = cmd.args[0] || "자산";
+       let typeMap = { "자산": "asset", "레벨": "level", "도감": "collection" };
+       let rankType = typeMap[type];
+
+       if (!rankType) {
+           cmd.reply(Utils.format("errors.invalidArgs", { command: "랭킹", usage: "<자산|레벨|도감>" }));
+           return;
+       }
+       
+       let rankList = RankingCache[rankType];
+       if (!rankList || rankList.length === 0) {
+           cmd.reply(Utils.format("general.noRankingData"));
+           return;
+       }
+       
+       let tpl = Locales.ui.ranking;
+       let medals = ["🥇", "🥈", "🥉"];
+       let top10 = rankList.slice(0, 10).map(function(r, i) {
+           let medal = i < 3 ? medals[i] + " " : (i + 1) + "위";
+           let valueStr = rankType === "asset" ? Utils.moneyStr(r.value) : r.value.toLocaleString();
+           return Utils.format(tpl.item, { medal: medal, nick: r.nick, value: valueStr });
+       }).join("\n");
+
+       let myRankMsg = "";
+       let myRankIdx = rankList.findIndex(function(r) { return r.nick === player.nick; });
+       if (myRankIdx > -1) {
+           let myValue = rankList[myRankIdx].value;
+           let valueStr = rankType === "asset" ? Utils.moneyStr(myValue) : myValue.toLocaleString();
+           myRankMsg = Utils.format(tpl.myRank, { rank: myRankIdx + 1, value: valueStr });
+       } else {
+           myRankMsg = tpl.myRank_out;
+       }
+
+       cmd.reply(Utils.format(tpl.header, { title: type }) + "\n" + top10 + "\n" + myRankMsg);
+   }
+};
+
+// ==================== 모듈: CommandExecutor ====================
+const CommandExecutor = {
+   execute: function(cmd) {
+       let commandInfo = CommandMap[cmd.command];
+       if (!commandInfo) {
+           for (let key in CommandMap) {
+               if (CommandMap[key].aliases && CommandMap[key].aliases.includes(cmd.command)) {
+                   commandInfo = CommandMap[key];
+                   cmd.command = key;
+                   break;
+               }
+           }
+       }
+       if (!commandInfo) return;
+
+       let player = PlayerService.getPlayer(cmd.author.name);
+
+       if (commandInfo.requireAuth && !player) {
+           cmd.reply(Utils.format("errors.notRegistered"));
+           return;
+       }
+       if (commandInfo.admin && (!SysConfig.adminNicknames || !SysConfig.adminNicknames.includes(cmd.author.name))) {
+           cmd.reply(Utils.format("errors.permissionDenied"));
+           return;
+       }
+       
+       let now = Date.now();
+       if (commandInfo.cooldown) {
+           let cooldownType = commandInfo.cooldown;
+           let cooldownConfig = GameConfig.cooldowns[cooldownType];
+           let lastActionTime = player.stats[cooldownType === "player" ? "lastFishAt" : "lastPillageAt"];
+           
+           if (now - lastActionTime < cooldownConfig) {
+               let remainTime = Math.ceil((cooldownConfig - (now - lastActionTime)) / 1000);
+               cmd.reply(Utils.format("fishing.cooldown", { remain: remainTime }));
+               return;
+           }
+       }
+       if (cmd.command === "낚시" && now - lastGlobalFishAt < GameConfig.cooldowns.global) {
+           let globalRemain = Math.ceil((GameConfig.cooldowns.global - (now - lastGlobalFishAt)) / 1000);
+           cmd.reply(Utils.format("fishing.globalCooldown", { remain: globalRemain }));
+           return;
+       }
+
+       let handler = CommandHandler[commandInfo.handler];
+       if (typeof handler === "function") {
+           if (commandInfo.delayed) {
+               let delay = GameConfig.delays[commandInfo.delay];
+               cmd.reply(Utils.format("delayedCommands." + cmd.command + "_start", { nick: player.nick }));
+               Utils.asyncDelay(cmd.room + "_" + cmd.author.name, delay, function() {
+                   handler(cmd, player);
+               });
+           } else {
+               handler(cmd, player);
+           }
+       } else {
+           Log.e("핸들러 없음: " + commandInfo.handler);
+       }
+   }
+};
+
+// ==================== 메인 컨트롤러 및 초기화 ====================
+const MasterController = {
+   onCommand: function(rawCmd) {
+       let sessionKey = rawCmd.room + "_" + rawCmd.author.name;
+       if (ActiveSessions.has(sessionKey)) return;
+       ActiveSessions.add(sessionKey);
+       
+       let prefix = SysConfig.commandPrefix;
+       let command = rawCmd.content.split(" ")[0].substring(prefix.length);
+       let args = rawCmd.content.split(" ").slice(1);
+       let cmd = { 
+           command: command, 
+           args: args, 
+           author: rawCmd.author, 
+           room: rawCmd.room, 
+           reply: rawCmd.reply.bind(rawCmd) 
+       };
+
+       try {
+           CommandExecutor.execute(cmd);
+       } catch (e) {
+           Log.e("명령어 실행 오류: " + cmd.command + "\n" + e.message + "\n" + e.stack);
+           cmd.reply(Utils.format("errors.unknown"));
+       } finally {
+           Utils.asyncDelay(sessionKey + "_unlock", 500, function() {
+               ActiveSessions.delete(sessionKey);
+           });
+       }
+   },
+
+   onStartCompile: function() {
+       for (let timerName in ActiveTimers) {
+           try { 
+               ActiveTimers[timerName].cancel(); 
+           } catch (e) {}
+       }
+       ActiveTimers = {};
+       if(PlayerCache) PlayerCache.clear();
+       ActiveSessions.clear();
+       Log.i("컴파일 시작 - 모든 리소스 정리 완료");
+   },
+
+   initialize: function() {
+       if (!DataManager.loadGameData()) {
+           Log.e("치명적 오류: 게임 데이터를 로드할 수 없습니다. 봇을 중지합니다.");
+           return;
+       }
+       
+       PlayerCache = {
+           cache: new Map(),
+           maxSize: GameConfig.settings.cacheSize || 100,
+           ttl: GameConfig.settings.cacheTTL || 300000,
+           get: function(key) {
+               if (!this.cache.has(key)) return null;
+               let entry = this.cache.get(key);
+               if (Date.now() - entry.timestamp > this.ttl) {
+                   this.cache.delete(key);
+                   return null;
+               }
+               this.cache.delete(key);
+               this.cache.set(key, entry);
+               return entry.data;
+           },
+           set: function(key, value) {
+               if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
+                   let firstKey = this.cache.keys().next().value;
+                   this.cache.delete(firstKey);
+               }
+               let entry = { data: value, timestamp: Date.now() };
+               this.cache.delete(key);
+               this.cache.set(key, entry);
+           },
+           clear: function() { 
+               this.cache.clear(); 
+           }
+       };
+
+       DataManager.initializeDirectories();
+       RankingManager.loadRankingCache();
+       
+       bot.setCommandPrefix(SysConfig.commandPrefix);
+       bot.addListener(Event.COMMAND, MasterController.onCommand);
+       bot.addListener(Event.START_COMPILE, MasterController.onStartCompile);
+
+       let periodicTask = new JavaAdapter(java.util.TimerTask, {
+           run: function() {
+               try { 
+                   RankingManager.updateRankingFullScan(); 
+               } catch (e) { 
+                   Log.e("주기적 작업 오류: " + e.message); 
+               }
+           }
+       });
+       
+       let timer = new java.util.Timer();
+       let interval = GameConfig.settings.rankingUpdateInterval;
+       timer.scheduleAtFixedRate(periodicTask, interval, interval);
+       ActiveTimers.periodic = timer;
+       
+       Log.i("낚시 게임 봇 v11.0.0 (Final) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
+   }
+};
+
+MasterController.initialize();

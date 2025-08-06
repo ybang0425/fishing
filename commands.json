@@ -1,0 +1,11 @@
+{
+  "도움말": { "handler": "handleHelp", "requireAuth": false, "aliases": ["명령어"] },
+  "회원가입": { "handler": "handleRegister", "requireAuth": false, "aliases": ["가입", "시작"] },
+  "내정보": { "handler": "handleInfo", "requireAuth": true, "aliases": ["정보"] },
+  "낚시": { "handler": "handleFishing", "requireAuth": true, "cooldown": "player", "delayed": true, "delay": "fishing" },
+  "판매": { "handler": "handleSell", "requireAuth": true },
+  "레벨업": { "handler": "handleLevelUp", "requireAuth": true },
+  "상점": { "handler": "handleShop", "requireAuth": true, "aliases": ["아이템상점"] },
+  "구매": { "handler": "handleBuy", "requireAuth": true },
+  "랭킹": { "handler": "handleRanking", "requireAuth": true }
+}

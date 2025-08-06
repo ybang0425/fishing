@@ -1,0 +1,7 @@
+{
+  "dataRoot": "sdcard/msgbot/fishing_game/data/",
+  "hashBuckets": 4,
+  "schemaVersion": 2,
+  "commandPrefix": "!",
+  "adminNicknames": ["임병현"]
+}

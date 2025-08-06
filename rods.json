@@ -1,0 +1,8 @@
+{
+  "basic": { "name": "기본낚싯대", "price": 0, "sellBonus": 0, "rareBonus": 0, "trashBonus": 0, "minLv": 1 },
+  "steel": { "name": "강철낚싯대", "price": 50000, "sellBonus": 0.05, "rareBonus": 0, "trashBonus": -0.05, "minLv": 2 },
+  "silver": { "name": "실버낚싯대", "price": 250000, "sellBonus": 0.10, "rareBonus": 0.05, "trashBonus": -0.10, "minLv": 3 },
+  "gold": { "name": "골드낚싯대", "price": 1000000, "sellBonus": 0.15, "rareBonus": 0.10, "trashBonus": -0.15, "minLv": 4 },
+  "carbon": { "name": "카본낚싯대", "price": 5000000, "sellBonus": 0.20, "rareBonus": 0.15, "trashBonus": -0.20, "minLv": 5 },
+  "master": { "name": "명인의낚싯대", "price": 20000000, "sellBonus": 0.30, "rareBonus": 0.25, "trashBonus": -0.30, "minLv": 7 }
+}

@@ -1,0 +1,13 @@
+{
+  "신": { "effect": {"rareBonus": 0.02}, "weight": 5 },
+  "포식자": { "effect": {"sellBonus": 0.02}, "weight": 4 },
+  "마스터": { "effect": {"rareBonus": 0.01}, "weight": 4 },
+  "낚시꾼": { "effect": {"sellBonus": 0.01}, "weight": 3 },
+  "오덕": { "effect": {}, "weight": 2 },
+  "십덕": { "effect": {}, "weight": 1 },
+  "도태된자": { "effect": {}, "weight": 2 },
+  "조현병": { "effect": {}, "weight": 1 },
+  "인생망함": { "effect": {}, "weight": 1 },
+  "코딱지": { "effect": {}, "weight": 1 },
+  "칭호없음": { "effect": {}, "weight": 0 }
+}

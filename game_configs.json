@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "cacheSize": 100,
+    "cacheTTL": 300000,
+    "maxCustomBaits": 10,
+    "rankingUpdateInterval": 600000
+  },
+  "cooldowns": {
+    "player": 10000,
+    "global": 3000,
+    "pillage": 3600000
+  },
+  "delays": {
+    "fishing": 3000,
+    "cooking": 2000,
+    "eating": 1500
+  },
+  "balance": {
+    "tutorialReward": 5000,
+    "pillagePenaltyRate": 0.5,
+    "cookRate": 1.5,
+    "titleBuyCost": 100000
+  },
+  "playerDefaults": {
+    "level": 1,
+    "activeTitle": "칭호없음",
+    "rod": "basic"
+  }
+}

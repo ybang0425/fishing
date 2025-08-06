@@ -1,0 +1,22 @@
+{
+  "free": {
+    "name": "기본미끼",
+    "effects": {
+      "catchBoost": 0.05
+    }
+  },
+  "paid": [
+    { "key": "premium", "name": "고급미끼", "price": 100000, "duration": 1800000, "effects": { "cooldown": -0.3, "catchBoost": 0.1 } },
+    { "key": "pocketmon", "name": "포켓몬미끼", "price": 500000, "duration": 1800000, "effects": { "pocketmon": 3.0 } },
+    { "key": "dino", "name": "공룡미끼", "price": 1000000, "duration": 1800000, "effects": { "dino": 3.0 } },
+    { "key": "goldFish", "name": "황금미끼", "price": 10000000, "duration": 3600000, "effects": { "legend": 5.0 } },
+    { "key": "pirate", "name": "해적미끼", "price": 200000, "duration": 1800000, "effects": { "pirate": 3.0 } },
+    { "key": "monster", "name": "괴수미끼", "price": 500000, "duration": 1800000, "effects": { "monster": 3.0 } },
+    { "key": "genshin", "name": "원신미끼", "price": 1000000, "duration": 1800000, "effects": { "genshin": 3.0 } },
+    { "key": "divine", "name": "신의미끼", "price": 5000000, "duration": 3600000, "effects": { "god": 5.0 } }
+  ],
+  "custom": {
+    "defaults": ["코나타", "마이키"],
+    "maxItems": 10
+  }
+}
