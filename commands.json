@@ -7,7 +7,7 @@
   "레벨업": { "handler": "handleLevelUp", "requireAuth": true },
   "상점": { "handler": "handleShop", "requireAuth": true, "aliases": ["아이템상점"] },
   "구매": { "handler": "handleBuy", "requireAuth": true },
-  "랭킹": { "handler": "handleRanking", "requireAuth": true }
+  "랭킹": { "handler": "handleRanking", "requireAuth": true },
   "미끼사용": { "handler": "handleUseBait", "requireAuth": true },
   "낚싯대장착": { "handler": "handleEquipRod", "requireAuth": true, "aliases": ["장착"] },
   "인벤토리": { "handler": "handleInventory", "requireAuth": true, "aliases": ["가방"] },
