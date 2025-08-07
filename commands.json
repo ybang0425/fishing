@@ -12,5 +12,6 @@
   "낚싯대장착": { "handler": "handleEquipRod", "requireAuth": true, "aliases": ["장착"] },
   "인벤토리": { "handler": "handleInventory", "requireAuth": true, "aliases": ["가방"] },
   "요리": { "handler": "handleCook", "requireAuth": true, "delayed": true, "delay": "cooking" },
-  "칭호변경": { "handler": "handleChangeTitle", "requireAuth": true, "aliases": ["칭호"] }
+  "칭호변경": { "handler": "handleChangeTitle", "requireAuth": true, "aliases": ["칭호"] },
+  "칭호구매": { "handler": "handleBuyTitle", "requireAuth": true, "aliases": ["칭호상점"] }
 }
