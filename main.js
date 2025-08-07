@@ -1,5 +1,5 @@
 /**
-* 낚시 게임 봇 v11.0.1 (Final Version, Patched)
+* 낚시 게임 봇 v11.0.2 (Final Version, Patched)
 *
 * @description
 * 최종 리팩토링: 성능 최적화, 핵심 기능 구현, 데이터 일관성 확보
@@ -8,6 +8,7 @@
 * - 스키마 버전 통일 및 마이그레이션 로직 명확화
 * - 구매, 레벨업, 상점, 랭킹 등 핵심 기능 핸들러 전체 구현
 * - v11.0.1: 초기화 안정성 강화 및 파일 I/O 오류 처리 개선
+* - v11.0.2: 미끼/낚싯대/인벤토리/요리/칭호 기능 핸들러 추가 및 초기화 안정성 강화
 */
 
 const bot = BotManager.getCurrentBot();
@@ -86,7 +87,6 @@ const DataManager = {
            let basePath = "sdcard/msgbot/fishing_game/config/";
            let files = ["config", "game_configs", "fish_data", "rods", "baits", "titles", "cook_suffixes", "level_costs", "locales", "commands"];
            
-           // 수정된 코드: FileStream.read() 반환값 및 JSON 파싱 오류 처리 강화
            let jsonData = [];
            for (let i = 0; i < files.length; i++) {
                let filePath = basePath + files[i] + ".json";
@@ -731,13 +731,101 @@ const CommandHandler = {
        }
 
        cmd.reply(Utils.format(tpl.header, { title: type }) + "\n" + top10 + "\n" + myRankMsg);
+   },
+
+   // --- 신규 핸들러 추가 ---
+   handleUseBait: function(cmd, player) {
+       let baitKey = cmd.args[0];
+       if (!baitKey) {
+           let ownedBaits = [];
+           GameData.BAITS.paid.forEach(function(bait) {
+               if (player.equipment.ownedBaits[bait.key] > 0) {
+                   ownedBaits.push(bait.name + " (" + player.equipment.ownedBaits[bait.key] + "개)");
+               }
+           });
+           cmd.reply("사용법: !미끼사용 <미끼키>\n보유 미끼: " + (ownedBaits.join(", ") || "없음"));
+           return;
+       }
+       let baitData = GameData.BAITS.paid.find(function(b) { return b.key === baitKey; });
+       if (!baitData || !player.equipment.ownedBaits[baitKey]) {
+           cmd.reply("해당 미끼를 보유하지 않았습니다.");
+           return;
+       }
+       player.equipment.ownedBaits[baitKey]--;
+       player.equipment.activeBait = {
+           key: baitKey,
+           name: baitData.name,
+           expires: Date.now() + baitData.duration
+       };
+       PlayerService.savePlayer(player);
+       cmd.reply(baitData.name + "을(를) 사용했습니다. " + Utils.formatTime(baitData.duration) + " 동안 유지됩니다.");
+   },
+
+   handleEquipRod: function(cmd, player) {
+       let rodKey = cmd.args[0];
+       if (!rodKey) {
+           let ownedRods = Object.keys(player.equipment.ownedRods).map(function(key) {
+               return GameData.RODS[key].name + (player.equipment.rod === key ? " (장착중)" : "");
+           });
+           cmd.reply("사용법: !낚싯대장착 <낚싯대키>\n보유 낚싯대: " + ownedRods.join(", "));
+           return;
+       }
+       if (!player.equipment.ownedRods[rodKey]) {
+           cmd.reply("해당 낚싯대를 보유하지 않았습니다.");
+           return;
+       }
+       player.equipment.rod = rodKey;
+       PlayerService.savePlayer(player);
+       cmd.reply(GameData.RODS[rodKey].name + "을(를) 장착했습니다.");
+   },
+
+   handleInventory: function(cmd, player) {
+       let viewMore = "\u200b".repeat(500);
+       let inventory = [];
+       Object.keys(player.inventory).forEach(function(item) {
+           if (player.inventory[item] > 0) {
+               inventory.push(item + " x" + player.inventory[item]);
+           }
+       });
+       cmd.reply("🎒 인벤토리\n" + viewMore +
+           (inventory.length > 0 ? inventory.join("\n") : "비어있음"));
+   },
+
+   handleCook: function(cmd, player) {
+       let fishName = cmd.args.join(" ");
+       if (!fishName || !player.inventory[fishName]) {
+           cmd.reply("사용법: !요리 <물고기이름>\n보유한 물고기만 요리 가능합니다.");
+           return;
+       }
+       let suffix = Utils.randomChoice(GameData.COOK_SUFFIXES);
+       let cookedName = "[요리]" + fishName + suffix;
+       player.inventory[fishName]--;
+       if (player.inventory[fishName] <= 0) delete player.inventory[fishName];
+       player.inventory[cookedName] = (player.inventory[cookedName] || 0) + 1;
+       PlayerService.savePlayer(player);
+       cmd.reply(fishName + "을(를) 요리해서 " + cookedName + "을(를) 만들었습니다!");
+   },
+
+   handleChangeTitle: function(cmd, player) {
+       let titleName = cmd.args.join(" ");
+       if (!titleName) {
+           let ownedTitles = Object.keys(player.equipment.ownedTitles);
+           cmd.reply("사용법: !칭호변경 <칭호이름>\n보유 칭호: " + ownedTitles.join(", "));
+           return;
+       }
+       if (!player.equipment.ownedTitles[titleName]) {
+           cmd.reply("해당 칭호를 보유하지 않았습니다.");
+           return;
+       }
+       player.profile.activeTitle = titleName;
+       PlayerService.savePlayer(player);
+       cmd.reply("칭호를 [" + titleName + "](으)로 변경했습니다.");
    }
 };
 
 // ==================== 모듈: CommandExecutor ====================
 const CommandExecutor = {
    execute: function(cmd) {
-       // 수정된 코드: CommandMap 초기화 실패 시 오류 방지
        if (!CommandMap || Object.keys(CommandMap).length === 0) {
            cmd.reply("봇이 아직 초기화되지 않았습니다. 잠시 후 다시 시도해주세요.");
            return;
@@ -833,18 +921,18 @@ const MasterController = {
 
    onStartCompile: function() {
        for (let timerName in ActiveTimers) {
-           try { 
-               ActiveTimers[timerName].cancel(); 
-           } catch (e) {}
+           try { ActiveTimers[timerName].cancel(); } catch (e) {}
        }
        ActiveTimers = {};
-       if(PlayerCache) PlayerCache.clear();
+       // 수정된 코드: PlayerCache 객체 및 clear 메소드 존재 여부 확인
+       if (PlayerCache && typeof PlayerCache.clear === "function") {
+           PlayerCache.clear();
+       }
        ActiveSessions.clear();
        Log.i("컴파일 시작 - 모든 리소스 정리 완료");
    },
 
    initialize: function() {
-       // 수정된 코드: 데이터 로드 실패 시 리스너 등록 등 후속 절차 중단
        if (!DataManager.loadGameData()) {
            Log.e("치명적 오류: 게임 데이터를 로드할 수 없습니다. 봇을 중지합니다.");
            return;
@@ -901,7 +989,7 @@ const MasterController = {
        timer.scheduleAtFixedRate(periodicTask, interval, interval);
        ActiveTimers.periodic = timer;
        
-       Log.i("낚시 게임 봇 v11.0.1 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
+       Log.i("낚시 게임 봇 v11.0.2 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
    }
 };
 
