@@ -1,17 +1,3 @@
-/**
-* 낚시 게임 봇 v11.0.3 (Final Version, Patched)
-*
-* @description
-* 최종 리팩토링: 성능 최적화, 핵심 기능 구현, 데이터 일관성 확보
-* - 증분 랭킹 업데이트 도입으로 I/O 최소화
-* - TTL(Time-To-Live) 기반의 LRU 캐시 적용
-* - 스키마 버전 통일 및 마이그레이션 로직 명확화
-* - 구매, 레벨업, 상점, 랭킹 등 핵심 기능 핸들러 전체 구현
-* - v11.0.1: 초기화 안정성 강화 및 파일 I/O 오류 처리 개선
-* - v11.0.2: 미끼/낚싯대/인벤토리/요리/칭호 기능 핸들러 추가 및 초기화 안정성 강화
-* - v11.0.3: 이름 기반 아이템 사용/장착, 칭호 구매 기능 추가
-*/
-
 const bot = BotManager.getCurrentBot();
 
 // ==================== 전역 상태 관리 ====================
@@ -29,6 +15,162 @@ let lastGlobalFishAt = 0;
 
 // ==================== 모듈: DataManager ====================
 const DataManager = {
+    // 기본 설정값 정의
+    getDefaultConfigs: function() {
+        return {
+            SysConfig: {
+                dataRoot: "sdcard/msgbot/fishing_game/data/",
+                hashBuckets: 4,
+                schemaVersion: 2,
+                commandPrefix: "!",
+                adminNicknames: []
+            },
+            GameConfig: {
+                settings: {
+                    cacheSize: 100,
+                    cacheTTL: 300000,
+                    maxCustomBaits: 10,
+                    rankingUpdateInterval: 600000
+                },
+                cooldowns: {
+                    player: 10000,
+                    global: 3000,
+                    pillage: 3600000
+                },
+                delays: {
+                    fishing: 3000,
+                    cooking: 2000,
+                    eating: 1500
+                },
+                balance: {
+                    tutorialReward: 5000,
+                    pillagePenaltyRate: 0.5,
+                    cookRate: 1.5,
+                    titleBuyCost: 100000
+                },
+                playerDefaults: {
+                    level: 1,
+                    activeTitle: "칭호없음",
+                    rod: "basic"
+                }
+            },
+            GameData: {
+                FISH: {
+                    totalFishCount: 3,
+                    endingsByGrade: {
+                        normal: ["(을)를 낚았다!"]
+                    },
+                    fishData: {
+                        "연어": { name: "연어", price: 500, chance: 0.5, minLv: 1, grade: "normal", emoji: "🐟", isRare: false }
+                    },
+                    fishByLevel: {
+                        "1": ["연어"]
+                    }
+                },
+                RODS: {
+                    basic: { name: "기본낚싯대", price: 0, sellBonus: 0, rareBonus: 0, trashBonus: 0, minLv: 1 }
+                },
+                BAITS: {
+                    free: { name: "기본미끼", effects: { catchBoost: 0.05 } },
+                    paid: [],
+                    custom: { defaults: [], maxItems: 10 }
+                },
+                TITLES: {
+                    "칭호없음": { effect: {}, weight: 0 }
+                },
+                COOK_SUFFIXES: ["구이"],
+                LEVEL_COSTS: [0, 100000]
+            },
+            Locales: {
+                errors: {
+                    notRegistered: "회원가입이 필요합니다.",
+                    unknown: "오류가 발생했습니다."
+                },
+                general: {
+                    registerSuccess: "환영합니다!"
+                },
+                fishing: {
+                    success: "{nick}님이 {fish}를 낚았다!",
+                    cooldown: "쿨타임 {remain}초"
+                }
+            },
+            CommandMap: {
+                "낚시": { handler: "handleFishing", requireAuth: true, cooldown: "player" },
+                "회원가입": { handler: "handleRegister", requireAuth: false },
+                "캐시갱신": { handler: "handleRefreshCache", requireAuth: false, admin: true }
+            }
+        };
+    },
+
+    loadGameData: function() {
+        let loadedFiles = 0;
+        let failedFiles = [];
+        let defaults = DataManager.getDefaultConfigs();
+        try {
+            let basePath = "sdcard/msgbot/fishing_game/config/";
+            let files = ["config", "game_configs", "fish_data", "rods", "baits", "titles", "cook_suffixes", "level_costs", "locales", "commands"];
+            let configNames = ["SysConfig", "GameConfig", "GameData.FISH", "GameData.RODS", "GameData.BAITS", "GameData.TITLES", "GameData.COOK_SUFFIXES", "GameData.LEVEL_COSTS", "Locales", "CommandMap"];
+            
+            // 기본값으로 먼저 초기화
+            SysConfig = defaults.SysConfig;
+            GameConfig = defaults.GameConfig;
+            GameData = defaults.GameData;
+            Locales = defaults.Locales;
+            CommandMap = defaults.CommandMap;
+
+            for (let i = 0; i < files.length; i++) {
+                let filePath = basePath + files[i] + ".json";
+                let content = FileStream.read(filePath);
+                if (!content) {
+                    Log.e("파일 읽기 실패, 기본값 사용: " + filePath);
+                    failedFiles.push(files[i]);
+                    continue;
+                }
+                try {
+                    let data = JSON.parse(content);
+                    loadedFiles++;
+                    // 정상 로드된 데이터 적용
+                    if (i === 0) SysConfig = data;
+                    else if (i === 1) GameConfig = data;
+                    else if (i === 2) GameData.FISH = data;
+                    else if (i === 3) GameData.RODS = data;
+                    else if (i === 4) GameData.BAITS = data;
+                    else if (i === 5) GameData.TITLES = data;
+                    else if (i === 6) GameData.COOK_SUFFIXES = data.suffixes;
+                    else if (i === 7) GameData.LEVEL_COSTS = data.costs;
+                    else if (i === 8) Locales = data;
+                    else if (i === 9) CommandMap = data;
+                } catch (e) {
+                    Log.e("JSON 파싱 실패, 기본값 사용 (" + files[i] + "): " + e.message);
+                    failedFiles.push(files[i]);
+                }
+            }
+            
+            if (loadedFiles > 0 || failedFiles.length < files.length) {
+                DataManager.buildReverseLookups();
+                Log.i("게임 데이터 부분 로드 완료 (성공: " + loadedFiles + "/" + files.length + ")");
+                if (failedFiles.length > 0) {
+                    Log.i("기본값 사용 파일: " + failedFiles.join(", "));
+                }
+                return true;
+            }
+            
+            Log.e("모든 설정 파일 로드 실패. 기본값으로 작동합니다.");
+            DataManager.buildReverseLookups();
+            return true;
+        } catch (e) {
+            Log.e("게임 데이터 로드 중 예외: " + e.message);
+            // 예외 발생해도 기본값으로 작동
+            SysConfig = defaults.SysConfig;
+            GameConfig = defaults.GameConfig;
+            GameData = defaults.GameData;
+            Locales = defaults.Locales;
+            CommandMap = defaults.CommandMap;
+            DataManager.buildReverseLookups();
+            return true;
+        }
+    },
+
    getHash: function(nick) {
        let hash = 0;
        for (let i = 0; i < nick.length; i++) {
@@ -83,60 +225,19 @@ const DataManager = {
        }
    },
 
-   loadGameData: function() {
-       try {
-           let basePath = "sdcard/msgbot/fishing_game/config/";
-           let files = ["config", "game_configs", "fish_data", "rods", "baits", "titles", "cook_suffixes", "level_costs", "locales", "commands"];
-           
-           let jsonData = [];
-           for (let i = 0; i < files.length; i++) {
-               let filePath = basePath + files[i] + ".json";
-               let content = FileStream.read(filePath);
-               if (!content) {
-                   Log.e("파일 읽기 실패: " + filePath);
-                   return false;
-               }
-               try {
-                   jsonData.push(JSON.parse(content));
-               } catch (e) {
-                   Log.e("JSON 파싱 실패 (" + files[i] + "): " + e.message);
-                   return false;
-               }
-           }
-           
-           SysConfig = jsonData[0];
-           GameConfig = jsonData[1];
-           GameData.FISH = jsonData[2];
-           GameData.RODS = jsonData[3];
-           GameData.BAITS = jsonData[4];
-           GameData.TITLES = jsonData[5];
-           GameData.COOK_SUFFIXES = jsonData[6].suffixes;
-           GameData.LEVEL_COSTS = jsonData[7].costs;
-           Locales = jsonData[8];
-           CommandMap = jsonData[9];
-           
-           DataManager.buildReverseLookups();
-           Log.i("모든 게임 데이터 로드 완료");
-           return true;
-       } catch (e) {
-           Log.e("게임 데이터 로드 실패: " + e.message + "\n" + e.stack);
-           return false;
-       }
-   },
-
    buildReverseLookups: function() {
        GameData.ITEM_MASTER = {};
-       GameData.NAME_TO_KEY = {}; // 추가
+       GameData.NAME_TO_KEY = {}; 
        Object.keys(GameData.RODS).forEach(function(key) {
            let rod = GameData.RODS[key];
            if (rod.price > 0) {
                GameData.ITEM_MASTER[rod.name] = { type: "rod", key: key, data: rod };
-               GameData.NAME_TO_KEY[rod.name] = key; // 추가
+               GameData.NAME_TO_KEY[rod.name] = key; 
            }
        });
        GameData.BAITS.paid.forEach(function(bait) {
            GameData.ITEM_MASTER[bait.name] = { type: "bait", key: bait.key, data: bait };
-           GameData.NAME_TO_KEY[bait.name] = bait.key; // 추가
+           GameData.NAME_TO_KEY[bait.name] = bait.key; 
        });
        GameData.COOK_REVERSE = new Set(GameData.COOK_SUFFIXES);
        Log.i("역참조 맵 생성 완료");
@@ -161,24 +262,48 @@ const DataManager = {
 
 // ==================== 모듈: PlayerService ====================
 const PlayerService = {
-   getPlayer: function(nick) {
-       let cachedPlayer = PlayerCache.get(nick);
-       if (cachedPlayer) return cachedPlayer;
-
-       let path = DataManager.getPlayerFilePath(nick);
-       let fileData = FileStream.read(path);
-       if (!fileData) return null;
-
-       let player = JSON.parse(fileData);
-       if (player.schemaVersion < SysConfig.schemaVersion) {
-           PlayerService.migratePlayer(player);
-       }
-       
-       PlayerCache.set(nick, player);
-       return player;
-   },
-
-   createPlayer: function(nick) {
+    // 파일 수정 시각 저장
+    fileModTimes: {},
+    getFileModTime: function(path) {
+        // 파일 읽기로 간접 체크 (더미 읽기)
+        let content = FileStream.read(path);
+        if (!content) return 0;
+        // 파일 내용의 해시값으로 변경 감지
+        let hash = 0;
+        for (let i = 0; i < Math.min(content.length, 100); i++) {
+            hash = ((hash << 5) - hash) + content.charCodeAt(i);
+            hash = hash & hash;
+        }
+        return hash;
+    },
+    getPlayer: function(nick, forceRefresh) {
+        let path = DataManager.getPlayerFilePath(nick);
+        // 강제 갱신 옵션
+        if (forceRefresh) {
+            PlayerCache.cache.delete(nick);
+            PlayerService.fileModTimes[nick] = null;
+        }
+        // 캐시 확인
+        let cachedPlayer = PlayerCache.get(nick);
+        // 파일 변경 감지
+        let currentModTime = PlayerService.getFileModTime(path);
+        let lastModTime = PlayerService.fileModTimes[nick] || 0;
+        if (cachedPlayer && currentModTime === lastModTime) {
+            return cachedPlayer;
+        }
+        // 파일이 변경되었거나 캐시가 없는 경우
+        let fileData = FileStream.read(path);
+        if (!fileData) return null;
+        let player = JSON.parse(fileData);
+        if (player.schemaVersion < SysConfig.schemaVersion) {
+            PlayerService.migratePlayer(player);
+        }
+        // 캐시 및 수정 시각 업데이트
+        PlayerCache.set(nick, player);
+        PlayerService.fileModTimes[nick] = currentModTime;
+        return player;
+    },
+    createPlayer: function(nick) {
        let defaults = GameConfig.playerDefaults;
        let player = {
            nick: nick,
@@ -208,19 +333,19 @@ const PlayerService = {
        DataManager.updatePlayerIndex(nick, "add");
        return player;
    },
-
-   savePlayer: function(player, options) {
-       if (!options) options = {};
-       player.lastModified = Date.now();
-       let path = DataManager.getPlayerFilePath(player.nick);
-       DataManager.atomicWrite(path, player);
-       PlayerCache.set(player.nick, player);
-       
-       if (!options.isNew) {
-           RankingManager.updateRankingIncremental(player);
-       }
-   },
-   
+    savePlayer: function(player, options) {
+        if (!options) options = {};
+        player.lastModified = Date.now();
+        let path = DataManager.getPlayerFilePath(player.nick);
+        // 저장 시 수정 시각 업데이트
+        DataManager.atomicWrite(path, player);
+        PlayerCache.set(player.nick, player);
+        // 수정 시각 즉시 갱신
+        PlayerService.fileModTimes[player.nick] = PlayerService.getFileModTime(path);
+        if (!options.isNew) {
+            RankingManager.updateRankingIncremental(player);
+        }
+    },
    migratePlayer: function(player) {
        if (player.schemaVersion < 2) {
            if (!player.equipment.customBaits) {
@@ -873,7 +998,28 @@ const CommandHandler = {
        player.equipment.ownedTitles[titleName] = true;
        PlayerService.savePlayer(player);
        cmd.reply("[" + titleName + "] 칭호를 구매했습니다!");
-   }
+   },
+    handleRefreshCache: function(cmd, player) {
+        if (!SysConfig.adminNicknames || !SysConfig.adminNicknames.includes(cmd.author.name)) {
+            cmd.reply("관리자만 사용 가능한 명령어입니다.");
+            return;
+        }
+        let targetNick = cmd.args[0];
+        if (!targetNick) {
+            // 전체 캐시 초기화
+            PlayerCache.clear();
+            PlayerService.fileModTimes = {};
+            cmd.reply("전체 캐시를 초기화했습니다.");
+        } else {
+            // 특정 플레이어 캐시 갱신
+            let refreshedPlayer = PlayerService.getPlayer(targetNick, true);
+            if (refreshedPlayer) {
+                cmd.reply(targetNick + "님의 캐시를 갱신했습니다.");
+            } else {
+                cmd.reply("해당 플레이어를 찾을 수 없습니다.");
+            }
+        }
+    }
 };
 
 // ==================== 모듈: CommandExecutor ====================
@@ -1041,7 +1187,7 @@ const MasterController = {
        timer.scheduleAtFixedRate(periodicTask, interval, interval);
        ActiveTimers.periodic = timer;
        
-       Log.i("낚시 게임 봇 v11.0.3 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
+       Log.i("낚시 게임 봇 v11.0.4 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
    }
 };
 
