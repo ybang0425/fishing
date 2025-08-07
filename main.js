@@ -1,5 +1,5 @@
 /**
-* 낚시 게임 봇 v11.0.2 (Final Version, Patched)
+* 낚시 게임 봇 v11.0.3 (Final Version, Patched)
 *
 * @description
 * 최종 리팩토링: 성능 최적화, 핵심 기능 구현, 데이터 일관성 확보
@@ -9,6 +9,7 @@
 * - 구매, 레벨업, 상점, 랭킹 등 핵심 기능 핸들러 전체 구현
 * - v11.0.1: 초기화 안정성 강화 및 파일 I/O 오류 처리 개선
 * - v11.0.2: 미끼/낚싯대/인벤토리/요리/칭호 기능 핸들러 추가 및 초기화 안정성 강화
+* - v11.0.3: 이름 기반 아이템 사용/장착, 칭호 구매 기능 추가
 */
 
 const bot = BotManager.getCurrentBot();
@@ -125,12 +126,17 @@ const DataManager = {
 
    buildReverseLookups: function() {
        GameData.ITEM_MASTER = {};
+       GameData.NAME_TO_KEY = {}; // 추가
        Object.keys(GameData.RODS).forEach(function(key) {
            let rod = GameData.RODS[key];
-           if (rod.price > 0) GameData.ITEM_MASTER[rod.name] = { type: "rod", key: key, data: rod };
+           if (rod.price > 0) {
+               GameData.ITEM_MASTER[rod.name] = { type: "rod", key: key, data: rod };
+               GameData.NAME_TO_KEY[rod.name] = key; // 추가
+           }
        });
        GameData.BAITS.paid.forEach(function(bait) {
            GameData.ITEM_MASTER[bait.name] = { type: "bait", key: bait.key, data: bait };
+           GameData.NAME_TO_KEY[bait.name] = bait.key; // 추가
        });
        GameData.COOK_REVERSE = new Set(GameData.COOK_SUFFIXES);
        Log.i("역참조 맵 생성 완료");
@@ -733,27 +739,30 @@ const CommandHandler = {
        cmd.reply(Utils.format(tpl.header, { title: type }) + "\n" + top10 + "\n" + myRankMsg);
    },
 
-   // --- 신규 핸들러 추가 ---
    handleUseBait: function(cmd, player) {
-       let baitKey = cmd.args[0];
-       if (!baitKey) {
+       let input = cmd.args.join(" ");
+       if (!input) {
            let ownedBaits = [];
            GameData.BAITS.paid.forEach(function(bait) {
                if (player.equipment.ownedBaits[bait.key] > 0) {
                    ownedBaits.push(bait.name + " (" + player.equipment.ownedBaits[bait.key] + "개)");
                }
            });
-           cmd.reply("사용법: !미끼사용 <미끼키>\n보유 미끼: " + (ownedBaits.join(", ") || "없음"));
+           cmd.reply("사용법: !미끼사용 <미끼이름>\n보유 미끼: " + (ownedBaits.join(", ") || "없음"));
            return;
        }
-       let baitData = GameData.BAITS.paid.find(function(b) { return b.key === baitKey; });
-       if (!baitData || !player.equipment.ownedBaits[baitKey]) {
+       // 이름으로 키 찾기
+       let baitKey = GameData.NAME_TO_KEY[input] || input;
+       let baitData = GameData.BAITS.paid.find(function(b) {
+           return b.key === baitKey || b.name === input;
+       });
+       if (!baitData || !player.equipment.ownedBaits[baitData.key]) {
            cmd.reply("해당 미끼를 보유하지 않았습니다.");
            return;
        }
-       player.equipment.ownedBaits[baitKey]--;
+       player.equipment.ownedBaits[baitData.key]--;
        player.equipment.activeBait = {
-           key: baitKey,
+           key: baitData.key,
            name: baitData.name,
            expires: Date.now() + baitData.duration
        };
@@ -762,21 +771,33 @@ const CommandHandler = {
    },
 
    handleEquipRod: function(cmd, player) {
-       let rodKey = cmd.args[0];
-       if (!rodKey) {
+       let input = cmd.args.join(" ");
+       if (!input) {
            let ownedRods = Object.keys(player.equipment.ownedRods).map(function(key) {
                return GameData.RODS[key].name + (player.equipment.rod === key ? " (장착중)" : "");
            });
-           cmd.reply("사용법: !낚싯대장착 <낚싯대키>\n보유 낚싯대: " + ownedRods.join(", "));
+           cmd.reply("사용법: !낚싯대장착 <낚싯대이름>\n보유 낚싯대: " + ownedRods.join(", "));
            return;
        }
-       if (!player.equipment.ownedRods[rodKey]) {
+       // 이름으로 키 찾기
+       let rodKey = GameData.NAME_TO_KEY[input] || input;
+       let rodData = GameData.RODS[rodKey];
+       if (!rodData) {
+           // 이름으로 직접 검색
+           Object.keys(GameData.RODS).forEach(function(key) {
+               if (GameData.RODS[key].name === input) {
+                   rodKey = key;
+                   rodData = GameData.RODS[key];
+               }
+           });
+       }
+       if (!rodData || !player.equipment.ownedRods[rodKey]) {
            cmd.reply("해당 낚싯대를 보유하지 않았습니다.");
            return;
        }
        player.equipment.rod = rodKey;
        PlayerService.savePlayer(player);
-       cmd.reply(GameData.RODS[rodKey].name + "을(를) 장착했습니다.");
+       cmd.reply(rodData.name + "을(를) 장착했습니다.");
    },
 
    handleInventory: function(cmd, player) {
@@ -820,6 +841,38 @@ const CommandHandler = {
        player.profile.activeTitle = titleName;
        PlayerService.savePlayer(player);
        cmd.reply("칭호를 [" + titleName + "](으)로 변경했습니다.");
+   },
+
+   handleBuyTitle: function(cmd, player) {
+       let titleName = cmd.args.join(" ");
+       if (!titleName) {
+           let availableTitles = Object.keys(GameData.TITLES).filter(function(t) {
+               return !player.equipment.ownedTitles[t] && t !== "칭호없음";
+           });
+           cmd.reply("사용법: !칭호구매 <칭호이름>\n구매 가능: " + availableTitles.join(", ") +
+                     "\n가격: " + Utils.moneyStr(GameConfig.balance.titleBuyCost));
+           return;
+       }
+       if (!GameData.TITLES[titleName] || titleName === "칭호없음") {
+           cmd.reply("구매할 수 없는 칭호입니다.");
+           return;
+       }
+       if (player.equipment.ownedTitles[titleName]) {
+           cmd.reply("이미 보유한 칭호입니다.");
+           return;
+       }
+       let cost = GameConfig.balance.titleBuyCost;
+       if (player.profile.money < cost) {
+           cmd.reply(Utils.format("errors.insufficientFunds", {
+               required: Utils.moneyStr(cost),
+               lacking: Utils.moneyStr(cost - player.profile.money)
+           }));
+           return;
+       }
+       player.profile.money -= cost;
+       player.equipment.ownedTitles[titleName] = true;
+       PlayerService.savePlayer(player);
+       cmd.reply("[" + titleName + "] 칭호를 구매했습니다!");
    }
 };
 
@@ -924,7 +977,6 @@ const MasterController = {
            try { ActiveTimers[timerName].cancel(); } catch (e) {}
        }
        ActiveTimers = {};
-       // 수정된 코드: PlayerCache 객체 및 clear 메소드 존재 여부 확인
        if (PlayerCache && typeof PlayerCache.clear === "function") {
            PlayerCache.clear();
        }
@@ -989,7 +1041,7 @@ const MasterController = {
        timer.scheduleAtFixedRate(periodicTask, interval, interval);
        ActiveTimers.periodic = timer;
        
-       Log.i("낚시 게임 봇 v11.0.2 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
+       Log.i("낚시 게임 봇 v11.0.3 (Final, Patched) 시작됨. 명령어 접두사: " + SysConfig.commandPrefix);
    }
 };
 
