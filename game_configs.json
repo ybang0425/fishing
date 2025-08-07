@@ -25,10 +25,5 @@
     "level": 1,
     "activeTitle": "칭호없음",
     "rod": "basic"
-  },
-  "delays": {
-  "fishing": 3000,
-  "cooking": 2000,  // 추가 필요
-  "eating": 1500
   }
 }
