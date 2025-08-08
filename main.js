@@ -687,7 +687,14 @@ const CommandHandler = {
    
    handleSell: function(cmd, player) {
        let itemName = cmd.args[0];
-       let qty = parseInt(cmd.args[1]) || 0;
+       // [FIX] cmd.args[1]이 undefined일 경우를 대비해 기본값 0을 안전하게 할당
+       let qtyInput = cmd.args[1];
+       let qty = qtyInput ? parseInt(qtyInput, 10) : 0;
+       
+       // [FIX] parseInt 결과가 숫자가 아닐 경우(NaN)를 대비해 0으로 처리
+       if (isNaN(qty)) {
+           qty = 0;
+       }
    
        if (!itemName) {
            cmd.reply(Utils.format("errors.invalidArgs", {command: "판매", usage: "<아이템|전체> [수량]"}));
@@ -722,6 +729,7 @@ const CommandHandler = {
            cmd.reply(Utils.format("errors.itemNotFound"));
            return;
        }
+       // [FIX] 수량이 0이거나 음수일 경우, 또는 보유량보다 많을 경우 전체 수량으로 설정
        qty = qty <= 0 || qty > player.inventory[itemName] ? player.inventory[itemName] : qty;
        
        let price = GameLogic.calculatePrice(itemName, player);
